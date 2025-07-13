@@ -10,6 +10,12 @@ use starknet::{
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
+// Paymaster fee optimization constants
+const UPWARD_THRESHOLD: u128 = 105;   // +5% - quickly react to gas price increases (profit optimization)
+const DOWNWARD_THRESHOLD: u128 = 85;  // -15% - slowly react to gas price decreases (preserve margins)
+const UPWARD_BUFFER: u128 = 110;      // +10% margin when gas price rises  
+const DOWNWARD_BUFFER: u128 = 110;    // +10% margin when gas price falls
+
 #[derive(Error, Debug)]
 pub enum UpdaterError {
     #[error("Starknet provider error: {0}")]
@@ -125,28 +131,59 @@ pub async fn check_fee_update(
         UpdaterError::Conversion("Current gas price too large for u128".to_string())
     })?;
 
-    // Calculate 20% threshold boundaries
-    let upper_threshold = contract_price_u128 * 120 / 100; // +20%
-    let lower_threshold = contract_price_u128 * 80 / 100; // -20%
+    // Asymmetric paymaster thresholds for profit optimization
+    let upward_threshold = contract_price_u128 * UPWARD_THRESHOLD / 100;   // +5% threshold
+    let downward_threshold = contract_price_u128 * DOWNWARD_THRESHOLD / 100; // -15% threshold
 
-    // Update needed if current price is outside the ±20% range
-    let should_update =
-        current_price_u128 > upper_threshold || current_price_u128 < lower_threshold;
+    // Determine update type and direction
+    let (should_update, update_direction) = if current_price_u128 > upward_threshold {
+        (true, "upward") // Gas price rising - quick reaction for profits
+    } else if current_price_u128 < downward_threshold {
+        (true, "downward") // Gas price falling - slow reaction to preserve margins
+    } else {
+        (false, "none") // Within acceptable range
+    };
 
     debug!(
-        "Gas price comparison - Current: {}, Contract: {}",
+        "Paymaster gas price analysis - Network: {}, Contract: {}",
         current_price_u128, contract_price_u128
     );
     debug!(
-        "Thresholds - Upper (+20%): {}, Lower (-20%): {}",
-        upper_threshold, lower_threshold
+        "Thresholds - Upward (+5%): {}, Downward (-15%): {}",
+        upward_threshold, downward_threshold
     );
-    info!("Fee update required: {} (outside ±20% range)", should_update);
+    info!(
+        "Fee update required: {} (direction: {}, network vs contract: {}%)", 
+        should_update, 
+        update_direction,
+        if contract_price_u128 > 0 {
+            (current_price_u128 as i128 - contract_price_u128 as i128) * 100 / contract_price_u128 as i128
+        } else { 0 }
+    );
 
     let new_gas_price = if should_update {
-        // Set gas price with 20% buffer to avoid frequent updates
-        let buffered_price = current_price_u128 * 120 / 100;
-        info!("New gas price to set (current + 20% buffer): {}", buffered_price);
+        let (buffered_price, margin_percent) = match update_direction {
+            "upward" => {
+                // Gas rising: Set higher price with 10% margin for consistent profit
+                let price = current_price_u128 * UPWARD_BUFFER / 100;
+                (price, 10)
+            },
+            "downward" => {
+                // Gas falling: Set lower price with 10% margin to preserve profits
+                let price = current_price_u128 * DOWNWARD_BUFFER / 100;
+                (price, 10)
+            },
+            _ => (current_price_u128, 0) // Fallback, shouldn't happen
+        };
+        
+        let paymaster_profit = buffered_price.saturating_sub(current_price_u128);
+        info!(
+            "New gas price for users: {} (network: {} + {}% margin = {} profit per tx)", 
+            buffered_price, 
+            current_price_u128, 
+            margin_percent,
+            paymaster_profit
+        );
         Felt::from(buffered_price)
     } else {
         Felt::ZERO
@@ -218,8 +255,12 @@ async fn check_transaction_status(
         Ok(_receipt) => {
             // If we got a receipt, the transaction was included in a block
             // Now check if contract was actually updated with expected value
+            debug!("Transaction receipt found, checking if contract was updated with expected value: {}", expected_gas_price);
             match check_if_update_completed(provider, contract_address, expected_gas_price).await {
-                Ok(true) => Ok(TransactionStatus::Confirmed),
+                Ok(true) => {
+                    info!("✅ Transaction confirmed - contract updated successfully");
+                    Ok(TransactionStatus::Confirmed)
+                },
                 Ok(false) => {
                     // Transaction was included but contract value doesn't match
                     // Let's see what the actual value is
@@ -276,5 +317,11 @@ async fn check_if_update_completed(
         )
         .await?[0];
 
-    Ok(current_contract_price == expected_gas_price)
+    let is_match = current_contract_price == expected_gas_price;
+    debug!(
+        "Update completion check - Contract: {}, Expected: {}, Match: {}",
+        current_contract_price, expected_gas_price, is_match
+    );
+    
+    Ok(is_match)
 }
