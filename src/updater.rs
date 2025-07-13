@@ -284,6 +284,14 @@ async fn check_transaction_status(
 
                     warn!("⚠️ Transaction included but contract value doesn't match expected");
                     warn!("   Expected: {}, Actual: {}", expected_gas_price, actual_value);
+                    warn!("   Expected_hex: {:x}, Actual_hex: {:x}", expected_gas_price, actual_value);
+                    
+                    // Check if values are actually the same (debug false positive)
+                    if actual_value == expected_gas_price {
+                        error!("🐛 BUG: Values are identical but check_if_update_completed returned false!");
+                        return Ok(TransactionStatus::Confirmed); // Force success
+                    }
+                    
                     Ok(TransactionStatus::Failed)
                 }
                 Err(e) => {
@@ -319,8 +327,8 @@ async fn check_if_update_completed(
 
     let is_match = current_contract_price == expected_gas_price;
     debug!(
-        "Update completion check - Contract: {}, Expected: {}, Match: {}",
-        current_contract_price, expected_gas_price, is_match
+        "Update completion check - Contract: {}, Expected: {}, Match: {}, Contract_hex: {:x}, Expected_hex: {:x}",
+        current_contract_price, expected_gas_price, is_match, current_contract_price, expected_gas_price
     );
     
     Ok(is_match)
