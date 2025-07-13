@@ -3,6 +3,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use starknet_types_core::felt::Felt;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tracing::{error, info, warn};
 use url::Url;
 
 use crate::updater::{check_fee_update, update_fee, PendingUpdate};
@@ -26,7 +27,15 @@ struct Args {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> anyhow::Result<()> {
+    // Initialize tracing with better configuration
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("pp_fee_updater=info".parse().unwrap())
+                .add_directive("info".parse().unwrap())
+        )
+        .init();
     let args = Args::parse();
     let ws_starknet_url = &args.websocket_url;
     let starknet_url = &args.api_url;
@@ -36,10 +45,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut pending_fee_update: Option<PendingUpdate> = None;
 
-    println!("Connecting to Starknet at: {}", ws_starknet_url);
+    info!("Connecting to Starknet WebSocket at: {}", ws_starknet_url);
 
     let (ws_stream, _) = connect_async(ws_starknet_url).await?;
-    println!("Connected to Starknet!");
+    info!("Successfully connected to Starknet WebSocket");
 
     let (mut write, mut read) = ws_stream.split();
 
@@ -51,7 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "id": 1
     });
 
-    println!("Subscribing to new blocks...");
+    info!("Subscribing to new block notifications...");
     write.send(Message::Text(subscribe_msg.to_string())).await?;
 
     // Listen for new blocks
@@ -63,54 +72,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(method) = json_value.get("method") {
                         if method == "starknet_subscriptionNewHeads" {
                             if let Some(params) = json_value.get("params") {
-                                println!("🔔 New Starknet block received:");
                                 if let Some(result) = params.get("result") {
                                     if let Some(block_number) = result.get("block_number") {
-                                        println!("🔥 New Starknet block: {}", block_number);
+                                        info!("📦 New Starknet block received: {}", block_number);
                                     }
                                     if let Some(block_hash) = result.get("block_hash") {
-                                        println!("   Block hash: {}", block_hash);
+                                        info!("   Block hash: {}", block_hash);
                                     }
                                 }
-                                let check_fee =
-                                    check_fee_update(starknet_url.clone(), privacy_pool_address, &mut pending_fee_update)
-                                        .await
-                                        .unwrap_or_else(|e| {
-                                            println!("Error checking fee update: {}", e);
-                                            (false, Felt::ZERO)
-                                        });
+                                let check_fee = match check_fee_update(starknet_url.clone(), privacy_pool_address, &mut pending_fee_update).await {
+                                    Ok(result) => result,
+                                    Err(e) => {
+                                        error!("Failed to check fee update: {:?}", e);
+                                        continue;
+                                    }
+                                };
 
                                 if check_fee.0 {
-                                    println!(
-                                        "⚠️ Fee update needed! Current gas price: {}",
-                                        check_fee.1
-                                    );
-                                    update_fee(
+                                    warn!("⚠️ Fee update needed! New gas price: {}", check_fee.1);
+                                    if let Err(e) = update_fee(
                                         starknet_url.clone(),
                                         check_fee.1,
                                         privacy_pool_address,
                                         owner_address,
                                         owner_private_key,
                                         &mut pending_fee_update,
-                                    )
-                                    .await
-                                    .unwrap_or_else(|e| {
-                                        println!("Error updating fee: {}", e);
-                                    });
+                                    ).await {
+                                        error!("Failed to update fee: {:?}", e);
+                                    }
                                 } else {
-                                    println!("✅ No fee update needed.");
+                                    info!("✅ Fee is up to date, no update needed");
                                 }
                             }
                         }
                     } else if json_value.get("result").is_some() {
-                        println!("✅ Subscription confirmed");
+                        info!("✅ WebSocket subscription confirmed");
                     } else if let Some(error) = json_value.get("error") {
-                        println!("❌ Error: {}", error);
+                        error!("❌ WebSocket JSON-RPC error: {}", error);
                     }
                 }
             }
             Ok(Message::Close(_)) => {
-                println!("Connection closed by server");
+                warn!("WebSocket connection closed by server");
                 break;
             }
             Ok(Message::Ping(data)) => {
@@ -118,12 +121,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Ok(_) => {}
             Err(e) => {
-                println!("WebSocket error: {}", e);
+                error!("WebSocket error: {}", e);
                 break;
             }
         }
     }
 
-    println!("Connection closed");
+    info!("WebSocket connection terminated");
     Ok(())
 }

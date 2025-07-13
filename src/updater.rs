@@ -7,8 +7,22 @@ use starknet::{
     providers::{jsonrpc::HttpTransport, JsonRpcClient, Provider, Url},
     signers::{LocalWallet, SigningKey},
 };
+use thiserror::Error;
+use tracing::{debug, error, info, warn};
 
-type BoxError = Box<dyn std::error::Error + Send + Sync>;
+#[derive(Error, Debug)]
+pub enum UpdaterError {
+    #[error("Starknet provider error: {0}")]
+    Provider(#[from] starknet::providers::ProviderError),
+    #[error("Account error: {0}")]
+    Account(String),
+    #[error("Conversion error: {0}")]
+    Conversion(String),
+    #[error("Invalid gas price: {0}")]
+    InvalidGasPrice(String),
+    #[error("Transaction failed or reverted")]
+    TransactionFailed,
+}
 
 // Structure to track pending update with transaction hash
 #[derive(Debug, Clone, Copy)]
@@ -29,15 +43,12 @@ pub async fn check_fee_update(
     url: Url,
     contract_address: Felt,
     pending_update: &mut Option<PendingUpdate>,
-) -> Result<(bool, Felt), BoxError> {
+) -> Result<(bool, Felt), UpdaterError> {
     let provider = JsonRpcClient::new(HttpTransport::new(url));
 
     // If there's a pending update, first check if it was confirmed or failed
     if let Some(pending) = *pending_update {
-        println!(
-            "⏳ Checking status of pending transaction: {:?}",
-            pending.tx_hash
-        );
+        info!("⏳ Checking status of pending transaction: {:?}", pending.tx_hash);
 
         match check_transaction_status(
             &provider,
@@ -48,21 +59,21 @@ pub async fn check_fee_update(
         .await
         {
             Ok(TransactionStatus::Confirmed) => {
-                println!("✅ Pending transaction confirmed on contract");
+                info!("✅ Pending transaction confirmed on contract");
                 *pending_update = None;
                 // Continue with normal check below
             }
             Ok(TransactionStatus::Failed) => {
-                println!("❌ Pending transaction failed, clearing pending state");
+                warn!("❌ Pending transaction failed, clearing pending state");
                 *pending_update = None;
                 // Continue with normal check below
             }
             Ok(TransactionStatus::Pending) => {
-                println!("⏳ Transaction still pending, skipping check");
+                debug!("⏳ Transaction still pending, skipping check");
                 return Ok((false, Felt::ZERO));
             }
             Err(e) => {
-                println!("❌ Error checking transaction status: {}", e);
+                error!("❌ Error checking transaction status: {:?}", e);
                 // Clear pending to avoid being stuck forever
                 *pending_update = None;
                 // Continue with normal check below
@@ -82,35 +93,37 @@ pub async fn check_fee_update(
             gas_price
         }
         starknet::core::types::MaybePendingBlockWithTxHashes::PendingBlock(_) => {
-            return Err("Cannot get gas price from pending block".into());
+            return Err(UpdaterError::InvalidGasPrice(
+                "Cannot get gas price from pending block".to_string(),
+            ));
         }
     };
 
-    println!("Current gas price (in fri): {}", current_gas_price);
+    info!("Current gas price (in fri): {}", current_gas_price);
 
     let gas_price_on_contract = provider
         .call(
             FunctionCall {
                 calldata: vec![],
                 contract_address,
-                entry_point_selector: get_selector_from_name("get_current_gas_price").unwrap(),
+                entry_point_selector: get_selector_from_name("get_current_gas_price")
+                    .map_err(|e| UpdaterError::Conversion(format!("Invalid selector: {}", e)))?,
             },
             BlockId::Tag(BlockTag::Latest),
         )
         .await?[0];
 
-    println!("Gas price on contract: {}", gas_price_on_contract);
+    info!("Gas price on contract: {}", gas_price_on_contract);
 
     // Check if current gas price differs by more than 20% from contract gas price
     // Convert Felt to u128 for calculation (Fri values should fit in u128)
-    let contract_price_u128: u128 = gas_price_on_contract
-        .to_biguint()
-        .try_into()
-        .map_err(|_| "Contract gas price too large for u128")?;
-    let current_price_u128: u128 = current_gas_price
-        .to_biguint()
-        .try_into()
-        .map_err(|_| "Current gas price too large for u128")?;
+    let contract_price_u128: u128 =
+        gas_price_on_contract.to_biguint().try_into().map_err(|_| {
+            UpdaterError::Conversion("Contract gas price too large for u128".to_string())
+        })?;
+    let current_price_u128: u128 = current_gas_price.to_biguint().try_into().map_err(|_| {
+        UpdaterError::Conversion("Current gas price too large for u128".to_string())
+    })?;
 
     // Calculate 20% threshold boundaries
     let upper_threshold = contract_price_u128 * 120 / 100; // +20%
@@ -120,25 +133,22 @@ pub async fn check_fee_update(
     let should_update =
         current_price_u128 > upper_threshold || current_price_u128 < lower_threshold;
 
-    println!(
-        "Current gas price: {}, Contract gas price: {}",
+    debug!(
+        "Gas price comparison - Current: {}, Contract: {}",
         current_price_u128, contract_price_u128
     );
-    println!(
-        "Upper threshold (+20%): {}, Lower threshold (-20%): {}",
+    debug!(
+        "Thresholds - Upper (+20%): {}, Lower (-20%): {}",
         upper_threshold, lower_threshold
     );
-    println!("Should update: {} (outside ±20% range)", should_update);
+    info!("Fee update required: {} (outside ±20% range)", should_update);
 
     let new_gas_price = if should_update {
-        // If update is needed, return the current gas price
-        println!(
-            "New gas price to set (120% of current): {}",
-            current_price_u128 * 120 / 100
-        );
-        Felt::from(current_price_u128 * 120 / 100) // Adjusted to 120% of current price
+        // Set gas price with 20% buffer to avoid frequent updates
+        let buffered_price = current_price_u128 * 120 / 100;
+        info!("New gas price to set (current + 20% buffer): {}", buffered_price);
+        Felt::from(buffered_price)
     } else {
-        // If no update is needed, return the Felt::ZERO
         Felt::ZERO
     };
 
@@ -152,7 +162,7 @@ pub async fn update_fee(
     owner_address: Felt,
     owner_private_key: Felt,
     pending_update: &mut Option<PendingUpdate>,
-) -> Result<(), BoxError> {
+) -> Result<(), UpdaterError> {
     let provider = JsonRpcClient::new(HttpTransport::new(url));
 
     let paymaster_account = SingleOwnerAccount::new(
@@ -163,7 +173,8 @@ pub async fn update_fee(
         ExecutionEncoding::New,
     );
 
-    let selector = get_selector_from_name("set_current_gas_price")?;
+    let selector = get_selector_from_name("set_current_gas_price")
+        .map_err(|e| UpdaterError::Conversion(format!("Invalid selector: {}", e)))?;
 
     let call = Call {
         to: contract_address,
@@ -175,8 +186,8 @@ pub async fn update_fee(
 
     match &invoke_result {
         Ok(result) => {
-            println!("✅ Transaction sent: {:?}", result.transaction_hash);
-            println!("⏳ Will check transaction status on next block");
+            info!("✅ Transaction sent: {:?}", result.transaction_hash);
+            info!("⏳ Will check transaction status on next block");
 
             // Set pending update with transaction hash
             *pending_update = Some(PendingUpdate {
@@ -185,12 +196,13 @@ pub async fn update_fee(
             });
         }
         Err(e) => {
-            println!("❌ Error sending transaction: {}", e);
+            error!("❌ Error sending transaction: {:?}", e);
             *pending_update = None;
+            return Err(UpdaterError::Account(format!("{:?}", e)));
         }
     }
 
-    invoke_result.map_err(|e| Box::new(e) as BoxError)?;
+    // Result already handled above
     Ok(())
 }
 
@@ -200,7 +212,7 @@ async fn check_transaction_status(
     tx_hash: Felt,
     contract_address: Felt,
     expected_gas_price: Felt,
-) -> Result<TransactionStatus, BoxError> {
+) -> Result<TransactionStatus, UpdaterError> {
     // First try to get transaction receipt
     match provider.get_transaction_receipt(tx_hash).await {
         Ok(_receipt) => {
@@ -216,20 +228,25 @@ async fn check_transaction_status(
                             FunctionCall {
                                 calldata: vec![],
                                 contract_address,
-                                entry_point_selector: get_selector_from_name("get_current_gas_price").unwrap(),
+                                entry_point_selector: get_selector_from_name(
+                                    "get_current_gas_price",
+                                )
+                                .map_err(|e| {
+                                    UpdaterError::Conversion(format!("Invalid selector: {}", e))
+                                })?,
                             },
                             BlockId::Tag(BlockTag::Latest),
                         )
                         .await
                         .map(|result| result[0])
                         .unwrap_or(Felt::ZERO);
-                    
-                    println!("⚠️ Transaction included but contract value doesn't match expected");
-                    println!("   Expected: {}, Actual: {}", expected_gas_price, actual_value);
+
+                    warn!("⚠️ Transaction included but contract value doesn't match expected");
+                    warn!("   Expected: {}, Actual: {}", expected_gas_price, actual_value);
                     Ok(TransactionStatus::Failed)
                 }
                 Err(e) => {
-                    println!("❌ Error checking contract value: {}", e);
+                    error!("❌ Error checking contract value: {:?}", e);
                     Ok(TransactionStatus::Failed)
                 }
             }
@@ -246,13 +263,14 @@ async fn check_if_update_completed(
     provider: &JsonRpcClient<HttpTransport>,
     contract_address: Felt,
     expected_gas_price: Felt,
-) -> Result<bool, BoxError> {
+) -> Result<bool, UpdaterError> {
     let current_contract_price = provider
         .call(
             FunctionCall {
                 calldata: vec![],
                 contract_address,
-                entry_point_selector: get_selector_from_name("get_current_gas_price").unwrap(),
+                entry_point_selector: get_selector_from_name("get_current_gas_price")
+                    .map_err(|e| UpdaterError::Conversion(format!("Invalid selector: {}", e)))?,
             },
             BlockId::Tag(BlockTag::Latest),
         )
