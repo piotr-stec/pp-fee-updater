@@ -10,11 +10,6 @@ use starknet::{
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
-// Paymaster fee optimization constants
-const UPWARD_THRESHOLD: u128 = 105;   // +5% - quickly react to gas price increases (profit optimization)
-const DOWNWARD_THRESHOLD: u128 = 85;  // -15% - slowly react to gas price decreases (preserve margins)
-const UPWARD_BUFFER: u128 = 110;      // +10% margin when gas price rises  
-const DOWNWARD_BUFFER: u128 = 110;    // +10% margin when gas price falls
 
 #[derive(Error, Debug)]
 pub enum UpdaterError {
@@ -49,6 +44,10 @@ pub async fn check_fee_update(
     url: Url,
     contract_address: Felt,
     pending_update: &mut Option<PendingUpdate>,
+    upward_threshold_const: u128,
+    downward_threshold_const: u128,
+    upward_buffer_const: u128,
+    downward_buffer_const: u128,
 ) -> Result<(bool, Felt), UpdaterError> {
     let provider = JsonRpcClient::new(HttpTransport::new(url));
 
@@ -132,8 +131,8 @@ pub async fn check_fee_update(
     })?;
 
     // Asymmetric paymaster thresholds for profit optimization
-    let upward_threshold = contract_price_u128 * UPWARD_THRESHOLD / 100;   // +5% threshold
-    let downward_threshold = contract_price_u128 * DOWNWARD_THRESHOLD / 100; // -15% threshold
+    let upward_threshold = contract_price_u128 * upward_threshold_const / 100;   // +5% threshold
+    let downward_threshold = contract_price_u128 * downward_threshold_const / 100; // -15% threshold
 
     // Determine update type and direction
     let (should_update, update_direction) = if current_price_u128 > upward_threshold {
@@ -165,12 +164,12 @@ pub async fn check_fee_update(
         let (buffered_price, margin_percent) = match update_direction {
             "upward" => {
                 // Gas rising: Set higher price with 10% margin for consistent profit
-                let price = current_price_u128 * UPWARD_BUFFER / 100;
+                let price = current_price_u128 * upward_buffer_const / 100;
                 (price, 10)
             },
             "downward" => {
                 // Gas falling: Set lower price with 10% margin to preserve profits
-                let price = current_price_u128 * DOWNWARD_BUFFER / 100;
+                let price = current_price_u128 * downward_buffer_const / 100;
                 (price, 10)
             },
             _ => (current_price_u128, 0) // Fallback, shouldn't happen
