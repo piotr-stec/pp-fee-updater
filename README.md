@@ -17,6 +17,10 @@ This service connects to Starknet WebSocket endpoints to receive real-time block
 | `PP_ADDRESS` | Privacy Pool contract address | Yes |
 | `OWNER_ADDRESS` | Contract owner address | Yes |
 | `OWNER_PRIVATE_KEY` | Private key for transactions | Yes |
+| `UPWARD_THRESHOLD` | Upward price change threshold (%) | No (default: 105) |
+| `DOWNWARD_THRESHOLD` | Downward price change threshold (%) | No (default: 85) |
+| `UPWARD_BUFFER` | Profit margin for upward updates (%) | No (default: 110) |
+| `DOWNWARD_BUFFER` | Profit margin for downward updates (%) | No (default: 110) |
 
 ### Command Line Arguments
 
@@ -41,8 +45,8 @@ The service uses different thresholds for upward and downward gas price movement
 
 | Direction | Threshold | Margin | Rationale |
 |-----------|-----------|---------|-----------|
-| **Upward** | +5% | +10% | Quick reaction to capture maximum profits |
-| **Downward** | -15% | +10% | Slow reaction to preserve margins |
+| **Upward** | +5% (105%) | +10% (110%) | Quick reaction to capture maximum profits |
+| **Downward** | -15% (85%) | +10% (110%) | Slow reaction to preserve margins |
 
 ### Update Conditions
 
