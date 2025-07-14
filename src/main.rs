@@ -24,6 +24,14 @@ struct Args {
     owner_address: Felt,
     #[arg(long, short = 'p', env = "OWNER_PRIVATE_KEY")]
     owner_private_key: Felt,
+    #[arg(long, env = "UPWARD_THRESHOLD")]
+    upward_threshold: u128,
+    #[arg(long, env = "DOWNWARD_THRESHOLD")]
+    downward_threshold: u128,
+    #[arg(long, env = "UPWARD_BUFFER")]
+    upward_buffer: u128,
+    #[arg(long, env = "DOWNWARD_BUFFER")]
+    downward_buffer: u128,
 }
 
 #[tokio::main]
@@ -33,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive("pp_fee_updater=info".parse().unwrap())
-                .add_directive("info".parse().unwrap())
+                .add_directive("info".parse().unwrap()),
         )
         .init();
     let args = Args::parse();
@@ -80,7 +88,17 @@ async fn main() -> anyhow::Result<()> {
                                         info!("   Block hash: {}", block_hash);
                                     }
                                 }
-                                let check_fee = match check_fee_update(starknet_url.clone(), privacy_pool_address, &mut pending_fee_update).await {
+                                let check_fee = match check_fee_update(
+                                    starknet_url.clone(),
+                                    privacy_pool_address,
+                                    &mut pending_fee_update,
+                                    args.upward_threshold,
+                                    args.downward_threshold,
+                                    args.upward_buffer,
+                                    args.downward_buffer,
+                                )
+                                .await
+                                {
                                     Ok(result) => result,
                                     Err(e) => {
                                         error!("Failed to check fee update: {:?}", e);
@@ -97,7 +115,9 @@ async fn main() -> anyhow::Result<()> {
                                         owner_address,
                                         owner_private_key,
                                         &mut pending_fee_update,
-                                    ).await {
+                                    )
+                                    .await
+                                    {
                                         error!("Failed to update fee: {:?}", e);
                                     }
                                 } else {
